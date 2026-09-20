@@ -19,6 +19,7 @@ public class Document {
     @Enumerated(EnumType.STRING)
     private DocumentType documentType;
     private String filePath;
+    @Column(unique = true, nullable = false)
     private  String fileHash;
 
 
