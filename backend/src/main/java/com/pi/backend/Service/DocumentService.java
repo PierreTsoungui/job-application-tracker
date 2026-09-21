@@ -1,10 +1,7 @@
 package com.pi.backend.Service;
 
-import com.pi.backend.model.ApplicationDocument;
-import com.pi.backend.model.ApplicationDocumentId;
-import com.pi.backend.model.Document;
-import com.pi.backend.model.DocumentType;
-import com.pi.backend.repository.ApplicationDocumentRepository;
+import com.pi.backend.model.*;
+import com.pi.backend.repository.ApplicationRepository;
 import com.pi.backend.repository.DocumentRepository;
 import jakarta.transaction.Transactional;
 import org.apache.tika.Tika;
@@ -34,14 +31,14 @@ public class DocumentService {
             Set.of(MIME_PDF, MIME_DOCX);
 
     private final DocumentRepository documentRepository;
-    private final ApplicationDocumentRepository applicationDocumentRepository;
+    private final ApplicationRepository  applicationRepository;
 
     public DocumentService(
             DocumentRepository documentRepository,
-            ApplicationDocumentRepository applicationDocumentRepository) {
+            ApplicationRepository applicationRepository) {
 
         this.documentRepository = documentRepository;
-        this.applicationDocumentRepository = applicationDocumentRepository;
+        this.applicationRepository = applicationRepository;
     }
     @Transactional
     public void uploadDocument(
@@ -49,90 +46,102 @@ public class DocumentService {
             List<DocumentType> documentTypes,
             long applicationId)
             throws NoSuchAlgorithmException, IOException {
-         boolean isCreated=false;
 
-         List<Path> createdFiles=new ArrayList<>();
         validateUpload(files, documentTypes);
+
+        Application application =
+                applicationRepository.findById(applicationId)
+                        .orElseThrow(() ->
+                                new IllegalArgumentException(
+                                        "Application not found."
+                                ));
+
+        List<Path> createdFiles = new ArrayList<>();
 
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         Tika tika = new Tika();
 
-        Path storageDirectory = Paths.get("uploads/applications");
+        Path storageDirectory =
+                Paths.get("uploads/applications");
+
         Files.createDirectories(storageDirectory);
 
-        for (int i = 0; i < files.size(); i++) {
+        try {
+            for (int i = 0; i < files.size(); i++) {
 
-            MultipartFile file = files.get(i);
-            DocumentType documentType = documentTypes.get(i);
+                MultipartFile file = files.get(i);
+                DocumentType documentType = documentTypes.get(i);
 
-            String mimeType;
+                String mimeType;
 
-            try (InputStream inputStream = file.getInputStream()) {
-                mimeType = tika.detect(inputStream);
+                try (InputStream inputStream =
+                             file.getInputStream()) {
+
+                    mimeType = tika.detect(inputStream);
+                }
+
+                validateMimeType(mimeType, documentType);
+
+                String fileHash =
+                        calculateHash(file, digest);
+
+                Optional<Document> existingDocument =
+                        documentRepository.findByFileHash(fileHash);
+
+                Document document;
+
+                if (existingDocument.isPresent()) {
+
+                    document = existingDocument.get();
+
+                    if (document.getDocumentType() != documentType) {
+                        throw new IllegalArgumentException(
+                                "The document already exists with a different document type."
+                        );
+                    }
+
+                } else {
+
+                    String extension =
+                            getExtension(mimeType);
+
+                    String storedFileName =
+                            fileHash + extension;
+
+                    Path path =
+                            storageDirectory.resolve(storedFileName);
+
+                    Files.copy(
+                            file.getInputStream(),
+                            path
+                    );
+
+                    createdFiles.add(path);
+
+                    document = Document.builder()
+                            .documentType(documentType)
+                            .fileName(file.getOriginalFilename())
+                            .fileHash(fileHash)
+                            .filePath(path.toString())
+                            .build();
+
+                    document = documentRepository.save(document);
+                }
+
+                application.getDocuments().add(document);
             }
 
-            validateMimeType(mimeType, documentType);
+        } catch (Exception e) {
 
-            String fileHash = calculateHash(file, digest);
+            for (Path path : createdFiles) {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException ex) {
+                    e.addSuppressed(ex);
+                }
+            }
 
-            Optional<Document> existingDocument =
-                    documentRepository.findByFileHash(fileHash);
-
-            Document document;
-           try {
-               if (existingDocument.isPresent()) {
-
-                   document = existingDocument.get();
-
-                   if (document.getDocumentType() != documentType) {
-                       throw new IllegalArgumentException(
-                               "The document already exists with a different document type."
-                       );
-                   }
-
-               } else {
-
-                   String extension = getExtension(mimeType);
-                   String storedFileName = fileHash + extension;
-
-                  Path path = storageDirectory.resolve(storedFileName);
-                   createdFiles.add(path);
-
-                   Files.copy(file.getInputStream(), path);
-
-                   document = Document.builder()
-                           .documentType(documentType)
-                           .fileName(file.getOriginalFilename())
-                           .fileHash(fileHash)
-                           .filePath(path.toString())
-                           .build();
-
-                   document = documentRepository.save(document);
-                   isCreated=true;
-               }
-
-               ApplicationDocumentId applicationDocumentId =
-                       ApplicationDocumentId.builder()
-                               .applicationId(applicationId)
-                               .documentId(document.getId())
-                               .build();
-
-               applicationDocumentRepository.save(
-                       new ApplicationDocument(applicationDocumentId)
-               );
-           }catch (Exception e) {
-               if(isCreated) {
-                   createdFiles.forEach(p-> {
-                       try {
-                           Files.deleteIfExists(p);
-                       } catch (IOException ex) {
-                           e.addSuppressed(ex);
-                       }
-                   });
-
-               }
-               throw e;
-           }
+            throw e;
         }
     }
     private void validateUpload(
@@ -241,4 +250,39 @@ public class DocumentService {
             );
         };
     }
+
+    @Transactional
+    public void deleteDocument(long applicationId, long documentId)
+            throws IOException {
+
+        Application application = applicationRepository.findById(applicationId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException("Application not found."));
+
+        Document document = documentRepository.findById(documentId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException("Document not found."));
+
+        if (!application.getDocuments().remove(document)) {
+            throw new IllegalArgumentException(
+                    "Document is not attached to this application."
+            );
+        }
+
+
+        boolean stillUsed = applicationRepository
+                .existsByDocumentsId(documentId);
+
+        if (!stillUsed) {
+
+            Path path = Paths.get(document.getFilePath());
+
+            Files.deleteIfExists(path);
+
+            documentRepository.delete(document);
+        }
+    }
+
+
+
 }
