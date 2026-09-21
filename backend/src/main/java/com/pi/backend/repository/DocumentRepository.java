@@ -11,4 +11,5 @@ public interface DocumentRepository extends JpaRepository<Document, Long> {
 
 
     Optional<Document> findByFileHash(String fileHash);
+
 }
